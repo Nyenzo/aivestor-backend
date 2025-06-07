@@ -1,7 +1,9 @@
+// Initializing Express, PostgreSQL, Firebase Admin, and JWT for the backend
 const express = require('express');
 const { Pool } = require('pg');
 const admin = require('firebase-admin');
 const jwt = require('jsonwebtoken');
+const predictionsRouter = require('./routes/predictions');
 const app = express();
 app.use(express.json());
 
@@ -21,7 +23,7 @@ const pool = new Pool({
 });
 
 // JWT Secret (use a strong secret in production; this is for demo purposes)
-const JWT_SECRET = 'your-very-secure-secret-key'; // Replace with a secure key in production
+const JWT_SECRET = process.env.JWT_SECRET || 'your-very-secure-secret-key'; 
 
 // Middleware to verify JWT
 const authenticateToken = (req, res, next) => {
@@ -40,6 +42,9 @@ const authenticateToken = (req, res, next) => {
 
 // Root endpoint
 app.get('/', (req, res) => res.send('Aivestor Backend API'));
+
+// Add predictions routes
+app.use('/api', predictionsRouter);
 
 // Test database connection (public endpoint)
 app.get('/api/test', async (req, res) => {
