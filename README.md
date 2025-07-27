@@ -87,14 +87,6 @@ Run the test suite:
 npm test
 ```
 
-## 📦 Deployment
-
-1. Build the project:
-   ```bash
-   npm run build
-   ```
-
-2. Deploy to your preferred hosting service (e.g., AWS, Heroku, DigitalOcean)
 
 ## 🤝 Contributing
 
@@ -108,12 +100,4 @@ npm test
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
-## 👥 Authors
 
-- Your Name - *Initial work* - [YourGithub](https://github.com/yourusername)
-
-## 🙏 Acknowledgments
-
-- Firebase team for excellent authentication services
-- Contributors and maintainers
-- Open source community 
