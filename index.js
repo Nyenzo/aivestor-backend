@@ -231,11 +231,32 @@ app.post('/api/portfolios', authenticateToken, async (req, res) => {
   }
 });
 
+// Fetch portfolio data with computed daily change and total gain
 app.get('/api/portfolios/user/:user_id', authenticateToken, async (req, res) => {
   const { user_id } = req.params;
   try {
     const result = await pool.query('SELECT * FROM portfolios WHERE user_id = $1', [user_id]);
-    res.json(result.rows);
+    const portfolios = result.rows;
+
+    const yf = require('yfinance');
+    const yfinance = require('yfinance').default;
+    for (let p of portfolios) {
+      const stock = yfinance(p.stock_symbol);
+      const history = await stock.history('1d');
+      if (!history.empty) {
+        const currentPrice = history['Close'].iloc[-1];
+        const dailyChange = (currentPrice - p.purchase_price) * p.quantity;
+        const totalGain = dailyChange;
+        await pool.query(
+          'UPDATE portfolios SET daily_change = $1, total_gain = $2 WHERE id = $3',
+          [dailyChange, totalGain, p.id]
+        );
+        p.daily_change = dailyChange;
+        p.total_gain = totalGain;
+      }
+    }
+
+    res.json(portfolios);
   } catch (err) {
     console.error(err.stack);
     res.status(500).json({ error: err.message });
@@ -268,6 +289,43 @@ app.delete('/api/portfolios/:id', authenticateToken, async (req, res) => {
       return res.status(404).json({ error: 'Portfolio entry not found' });
     }
     res.json({ message: 'Portfolio entry deleted', portfolio: result.rows[0] });
+  } catch (err) {
+    console.error(err.stack);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Fetch top gainers and losers
+app.get('/api/market/top', authenticateToken, async (req, res) => {
+  try {
+    const yf = require('yfinance');
+    const yfinance = require('yfinance').default;
+    const axios = require('axios');
+    const allTickers = ['AAPL', 'MSFT', 'AMZN', 'GOOGL', 'META', 'TSLA', 'NVDA', 'AMD', 'INTC', 'TSM', 'QCOM'];
+    const predictions = await Promise.all(allTickers.map(async (ticker) => {
+      const stock = yfinance(ticker);
+      const history = await stock.history('1d');
+      if (!history.empty) {
+        const currentPrice = history['Close'].iloc[-1];
+        const prevPrice = history['Close'].iloc[-2] || currentPrice;
+        const changePercent = ((currentPrice - prevPrice) / prevPrice) * 100;
+        const response = await axios.get(`http://localhost:5001/predict/${ticker}`, {
+          headers: { Authorization: `Bearer ${jwt.sign({ service: 'backend' }, JWT_SECRET)}` }
+        });
+        return {
+          ticker,
+          price: currentPrice,
+          change: changePercent,
+          buyProbability: response.data.short_term_probabilities.Buy
+        };
+      }
+      return null;
+    }).filter(p => p !== null));
+
+    const gainers = predictions.sort((a, b) => b.change - a.change).slice(0, 3);
+    const losers = predictions.sort((a, b) => a.change - b.change).slice(0, 3);
+
+    res.json({ gainers, losers });
   } catch (err) {
     console.error(err.stack);
     res.status(500).json({ error: err.message });
