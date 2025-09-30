@@ -332,6 +332,22 @@ app.get('/api/market/top', authenticateToken, async (req, res) => {
   }
 });
 
-app.listen(5000, () => console.log('Server running on port 5000'));
+const http = require('http');
+const { Server } = require('socket.io');
+const server = http.createServer(app);
+const io = new Server(server, { cors: { origin: '*' } });
+
+io.on('connection', (socket) => {
+  console.log('A client connected:', socket.id);
+  socket.on('disconnect', () => {
+    console.log('Client disconnected:', socket.id);
+  });
+});
+
+function emitPriceUpdate(data) {
+  io.emit('price_update', data);
+}
+
+server.listen(5000, () => console.log('Server running on port 5000 with WebSocket support'));
 
 process.on('SIGTERM', () => pool.end());
