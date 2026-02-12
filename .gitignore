@@ -1,3 +1,22 @@
+# Dependencies
 node_modules/
+
+# Environment
 .env
+.env.local
+
+# Firebase credentials
 aivestor-firebase-adminsdk.json
+
+# Coverage
+coverage/
+
+# Logs
+*.log
+
+# Build
+dist/
+
+# OS
+.DS_Store
+Thumbs.db
