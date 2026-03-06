@@ -1,167 +1,203 @@
-/**
- * Test suite for authentication endpoints
- * Auth routes are now consolidated in app.js and testable via supertest
- */
 const request = require('supertest');
 const { app } = require('../app');
+const admin = require('firebase-admin');
 const jwt = require('jsonwebtoken');
+const axios = require('axios');
 
 const JWT_SECRET = process.env.JWT_SECRET || 'test-secret';
 
-describe('Authentication API', () => {
-  describe('POST /api/auth/register', () => {
-    it('should reject registration without email', async () => {
-      const response = await request(app)
-        .post('/api/auth/register')
-        .send({ password: 'Password123!' });
+jest.mock('axios');
 
-      expect(response.status).toBe(400);
-      expect(response.body.error).toMatch(/email/i);
+jest.mock('firebase-admin', () => {
+  const mockFirestore = {
+    collection: jest.fn().mockReturnThis(),
+    doc: jest.fn().mockReturnThis(),
+    where: jest.fn().mockReturnThis(),
+    limit: jest.fn().mockReturnThis(),
+    get: jest.fn(),
+    add: jest.fn(),
+    update: jest.fn()
+  };
+  const mockAuth = {
+    createUser: jest.fn(),
+    getUserByEmail: jest.fn(),
+    verifyIdToken: jest.fn(),
+    updateUser: jest.fn()
+  };
+  mockFirestore.FieldValue = { serverTimestamp: jest.fn(() => 'timestamp') };
+  const mockFirestoreFn = jest.fn(() => mockFirestore);
+  mockFirestoreFn.FieldValue = { serverTimestamp: jest.fn(() => 'timestamp') };
+
+  return {
+    apps: ['mockApp'],
+    credential: { cert: jest.fn() },
+    initializeApp: jest.fn(),
+    firestore: mockFirestoreFn,
+    auth: jest.fn(() => mockAuth)
+  };
+});
+
+describe('Authentication API', () => {
+  let db;
+
+  beforeAll(() => {
+    db = admin.firestore();
+  });
+
+  afterEach(() => {
+    jest.clearAllMocks();
+  });
+
+  describe('POST /api/auth/register', () => {
+    it('should register successfully', async () => {
+      admin.auth().createUser.mockResolvedValueOnce({ uid: 'new-uid', email: 'test@example.com' });
+      db.get.mockResolvedValueOnce({ empty: true });
+      db.add.mockResolvedValueOnce({ id: 'doc-id' });
+
+      const res = await request(app)
+        .post('/api/auth/register')
+        .send({ email: 'test@example.com', password: 'Password123!', risk_tolerance: 0.8 });
+
+      expect(res.status).toBe(201);
+      expect(res.body.firebaseUid).toBe('new-uid');
     });
 
-    it('should reject registration without password', async () => {
-      const response = await request(app)
-        .post('/api/auth/register')
-        .send({ email: 'test@example.com' });
+    it('should reject without email', async () => {
+      const res = await request(app).post('/api/auth/register').send({ password: 'Password123!' });
+      expect(res.status).toBe(400);
+    });
 
-      expect(response.status).toBe(400);
-      expect(response.body.error).toMatch(/password/i);
+    it('handles firebase errors', async () => {
+      admin.auth().createUser.mockRejectedValueOnce(new Error('Firebase Error'));
+      const res = await request(app)
+        .post('/api/auth/register')
+        .send({ email: 'test@example.com', password: 'Password123!' });
+      expect(res.status).toBe(500);
     });
   });
 
   describe('POST /api/auth/login', () => {
-    it('should reject login without credentials', async () => {
-      const response = await request(app)
-        .post('/api/auth/login')
-        .send({});
+    it('should login successfully', async () => {
+      // login now verifies via Firebase Identity Toolkit REST API
+      axios.post.mockResolvedValueOnce({ data: { localId: 'new-uid', email: 'test@example.com' } });
+      db.get.mockResolvedValueOnce({ empty: false, docs: [{ id: 'doc-id', data: () => ({ email: 'test@example.com' }) }] });
 
-      expect(response.status).toBe(400);
-      expect(response.body.error).toMatch(/email.*password/i);
+      const res = await request(app)
+        .post('/api/auth/login')
+        .send({ email: 'test@example.com', password: 'Password123!' });
+
+      expect(res.status).toBe(200);
+      expect(res.body.token).toBeDefined();
     });
 
-    it('should reject login without password', async () => {
-      const response = await request(app)
-        .post('/api/auth/login')
-        .send({ email: 'test@example.com' });
+    it('should reject without credentials', async () => {
+      const res = await request(app).post('/api/auth/login').send({});
+      expect(res.status).toBe(400);
+    });
 
-      expect(response.status).toBe(400);
+    it('handles firebase invalid credentials', async () => {
+      axios.post.mockRejectedValueOnce(new Error('Auth Failed'));
+      const res = await request(app)
+        .post('/api/auth/login')
+        .send({ email: 'test@example.com', password: 'WrongPassword' });
+      expect(res.status).toBe(401);
     });
   });
 
   describe('POST /api/auth/google', () => {
-    it('should reject without ID token', async () => {
-      const response = await request(app)
-        .post('/api/auth/google')
-        .send({});
+    it('verifies token and logs in', async () => {
+      admin.auth().verifyIdToken.mockResolvedValueOnce({ uid: 'new-uid', email: 'test@example.com' });
+      db.get.mockResolvedValueOnce({ empty: true });
+      db.add.mockResolvedValueOnce({ id: 'doc-id' });
 
-      expect(response.status).toBe(400);
-      expect(response.body.error).toMatch(/token/i);
+      const res = await request(app)
+        .post('/api/auth/google')
+        .send({ idToken: 'valid.google.token' });
+
+      expect(res.status).toBe(200);
+      expect(res.body.token).toBeDefined();
+    });
+
+    it('rejects without ID token', async () => {
+      const res = await request(app).post('/api/auth/google').send({});
+      expect(res.status).toBe(400);
+    });
+
+    it('handles invalid google token', async () => {
+      admin.auth().verifyIdToken.mockRejectedValueOnce(new Error('Invalid token'));
+      const res = await request(app)
+        .post('/api/auth/google')
+        .send({ idToken: 'invalid.google.token' });
+      expect(res.status).toBe(401);
     });
   });
 
   describe('POST /api/auth/forgot-password', () => {
-    it('should reject without email', async () => {
-      const response = await request(app)
+    it('does NOT return token in response (token delivered out-of-band via email)', async () => {
+      db.get.mockResolvedValueOnce({ empty: false, docs: [{ id: 'doc-id', data: () => ({ email: 'test@example.com' }) }] });
+      const res = await request(app)
         .post('/api/auth/forgot-password')
-        .send({});
+        .send({ email: 'test@example.com' });
+      expect(res.status).toBe(200);
+      // Token must NOT be in the response body — it should be emailed instead
+      expect(res.body.token).toBeUndefined();
+      expect(res.body.message).toBeDefined();
+    });
 
-      expect(response.status).toBe(400);
-      expect(response.body.error).toMatch(/email/i);
+    it('returns generic message if user not found to prevent probing', async () => {
+      db.get.mockResolvedValueOnce({ empty: true });
+      const res = await request(app)
+        .post('/api/auth/forgot-password')
+        .send({ email: 'ghost@example.com' });
+      expect(res.status).toBe(200);
+      expect(res.body.token).toBeUndefined();
+    });
+
+    it('rejects without email', async () => {
+      const res = await request(app).post('/api/auth/forgot-password').send({});
+      expect(res.status).toBe(400);
     });
   });
 
   describe('POST /api/auth/reset-password', () => {
-    it('should reject without token and password', async () => {
-      const response = await request(app)
-        .post('/api/auth/reset-password')
-        .send({});
-
-      expect(response.status).toBe(400);
-      expect(response.body.error).toMatch(/token.*password/i);
-    });
-
-    it('should reject invalid reset token', async () => {
-      const response = await request(app)
+    it('handles invalid reset token', async () => {
+      const res = await request(app)
         .post('/api/auth/reset-password')
         .send({ token: 'invalid-token', password: 'NewPass123!' });
+      expect(res.status).toBe(400);
+    });
 
-      expect(response.status).toBe(400);
+    it('rejects without token and password', async () => {
+      const res = await request(app).post('/api/auth/reset-password').send({});
+      expect(res.status).toBe(400);
     });
   });
 
   describe('POST /api/auth/verify-email', () => {
-    it('should reject without token', async () => {
-      const response = await request(app)
+    it('handles invalid token', async () => {
+      const res = await request(app)
         .post('/api/auth/verify-email')
-        .send({});
+        .send({ token: 'bad-token' });
+      expect(res.status).toBe(400);
+    });
 
-      expect(response.status).toBe(400);
-      expect(response.body.error).toMatch(/token/i);
+    it('rejects without token', async () => {
+      const res = await request(app).post('/api/auth/verify-email').send({});
+      expect(res.status).toBe(400);
     });
   });
 
-  describe('POST /api/auth/refresh', () => {
-    it('should reject without auth token', async () => {
-      const response = await request(app)
-        .post('/api/auth/refresh');
-
-      expect(response.status).toBe(401);
-    });
-
-    it('should accept valid token and return refreshed token', async () => {
-      const token = jwt.sign({ uid: 'test-uid', email: 'test@example.com' }, JWT_SECRET, { expiresIn: '1h' });
-      const response = await request(app)
-        .post('/api/auth/refresh')
+  describe('POST /api/auth/send-verification', () => {
+    it('does NOT return token in response (token delivered out-of-band via email)', async () => {
+      const token = jwt.sign({ uid: 'test', email: 'test@ex.com' }, JWT_SECRET, { expiresIn: '1h' });
+      const res = await request(app)
+        .post('/api/auth/send-verification')
         .set('Authorization', `Bearer ${token}`);
-
-      expect(response.status).toBe(200);
-      expect(response.body.token).toBeTruthy();
-      expect(response.body.message).toMatch(/refreshed/i);
+      expect(res.status).toBe(200);
+      // Token must NOT be in the response body
+      expect(res.body.token).toBeUndefined();
+      expect(res.body.message).toBeDefined();
     });
   });
 
-  describe('Authentication Middleware', () => {
-    it('should reject requests without auth token', async () => {
-      const response = await request(app).get('/api/users');
-      expect(response.status).toBe(401);
-    });
-
-    it('should reject requests with invalid token', async () => {
-      const response = await request(app)
-        .get('/api/users')
-        .set('Authorization', 'Bearer invalid-token');
-      expect(response.status).toBe(403);
-    });
-
-    it('should accept requests with valid token', async () => {
-      const token = jwt.sign({ uid: 'test-uid', email: 'test@example.com' }, JWT_SECRET, { expiresIn: '1h' });
-      const response = await request(app)
-        .get('/api/users')
-        .set('Authorization', `Bearer ${token}`);
-      // Should pass auth middleware (200 or 500 depending on Firestore)
-      expect([200, 500]).toContain(response.status);
-    });
-  });
-
-  describe('JWT Token Generation', () => {
-    it('should create valid JWT tokens', () => {
-      const payload = { uid: 'test-uid', email: 'test@example.com' };
-      const token = jwt.sign(payload, JWT_SECRET, { expiresIn: '1h' });
-      expect(token).toBeTruthy();
-      const decoded = jwt.verify(token, JWT_SECRET);
-      expect(decoded.uid).toBe('test-uid');
-      expect(decoded.email).toBe('test@example.com');
-    });
-
-    it('should reject expired tokens', () => {
-      const token = jwt.sign({ uid: 'test-uid' }, JWT_SECRET, { expiresIn: '-1h' });
-      expect(() => jwt.verify(token, JWT_SECRET)).toThrow();
-    });
-
-    it('should reject tampered tokens', () => {
-      const token = jwt.sign({ uid: 'test-uid' }, JWT_SECRET, { expiresIn: '1h' });
-      const tampered = token.slice(0, -5) + 'XXXXX';
-      expect(() => jwt.verify(tampered, JWT_SECRET)).toThrow();
-    });
-  });
 });

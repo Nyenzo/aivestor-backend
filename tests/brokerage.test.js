@@ -1,9 +1,30 @@
-/**
- * Test suite for brokerage endpoints
- */
+
 const request = require('supertest');
 const { app } = require('../app');
 const jwt = require('jsonwebtoken');
+const admin = require('firebase-admin');
+
+jest.mock('firebase-admin', () => {
+    const mockFirestore = {
+        collection: jest.fn().mockReturnThis(),
+        doc: jest.fn().mockReturnThis(),
+        where: jest.fn().mockReturnThis(),
+        orderBy: jest.fn().mockReturnThis(),
+        limit: jest.fn().mockReturnThis(),
+        get: jest.fn(() => ({ empty: true, docs: [] })),
+        add: jest.fn(() => ({ id: 'mock-id' })),
+        update: jest.fn()
+    };
+    const mockFirestoreFn = jest.fn(() => mockFirestore);
+    mockFirestoreFn.FieldValue = { serverTimestamp: jest.fn(() => 'timestamp') };
+    return {
+        apps: ['mockApp'],
+        credential: { cert: jest.fn() },
+        initializeApp: jest.fn(),
+        firestore: mockFirestoreFn,
+        auth: jest.fn(() => ({}))
+    };
+});
 
 const JWT_SECRET = process.env.JWT_SECRET || 'test-secret';
 
@@ -12,6 +33,11 @@ function makeToken(overrides = {}) {
 }
 
 describe('Brokerage Endpoints', () => {
+    let db;
+    beforeAll(() => {
+        db = admin.firestore();
+    });
+
     describe('POST /api/brokerage/connect', () => {
         it('should reject without auth token', async () => {
             const res = await request(app)
@@ -41,6 +67,25 @@ describe('Brokerage Endpoints', () => {
                 expect(res.body.status).toBe('connected');
             }
         });
+
+        it('should reconnect if exist', async () => {
+            db.get.mockResolvedValueOnce({ empty: false, docs: [{ id: 'mock-doc', data: () => ({}) }] });
+            db.update.mockResolvedValueOnce({});
+            const res = await request(app)
+                .post('/api/brokerage/connect')
+                .set('Authorization', `Bearer ${makeToken()}`)
+                .send({ brokerName: 'Alpaca' });
+            expect([200, 500]).toContain(res.status);
+        });
+
+        it('should catch db error', async () => {
+            db.get.mockRejectedValueOnce(new Error('DB Failed'));
+            const res = await request(app)
+                .post('/api/brokerage/connect')
+                .set('Authorization', `Bearer ${makeToken()}`)
+                .send({ brokerName: 'Alpaca' });
+            expect(res.status).toBe(500);
+        });
     });
 
     describe('GET /api/brokerage/status', () => {
@@ -58,6 +103,14 @@ describe('Brokerage Endpoints', () => {
                 expect(Array.isArray(res.body)).toBe(true);
             }
         });
+
+        it('should catch db error', async () => {
+            db.get.mockRejectedValueOnce(new Error('DB Failed'));
+            const res = await request(app)
+                .get('/api/brokerage/status')
+                .set('Authorization', `Bearer ${makeToken()}`);
+            expect(res.status).toBe(500);
+        });
     });
 
     describe('DELETE /api/brokerage/disconnect', () => {
@@ -74,6 +127,25 @@ describe('Brokerage Endpoints', () => {
                 .set('Authorization', `Bearer ${makeToken()}`)
                 .send({});
             expect(res.status).toBe(400);
+        });
+
+        it('should disconnect successfully', async () => {
+            db.get.mockResolvedValueOnce({ empty: false, docs: [{ id: 'mock-doc' }] });
+            db.update.mockResolvedValueOnce({});
+            const res = await request(app)
+                .delete('/api/brokerage/disconnect')
+                .set('Authorization', `Bearer ${makeToken()}`)
+                .send({ brokerName: 'Alpaca' });
+            expect([200, 500]).toContain(res.status);
+        });
+
+        it('should catch db error', async () => {
+            db.get.mockRejectedValueOnce(new Error('DB Failed'));
+            const res = await request(app)
+                .delete('/api/brokerage/disconnect')
+                .set('Authorization', `Bearer ${makeToken()}`)
+                .send({ brokerName: 'Alpaca' });
+            expect(res.status).toBe(500);
         });
     });
 
@@ -130,6 +202,26 @@ describe('Brokerage Endpoints', () => {
                 expect(res.body.transaction).toBeTruthy();
                 expect(res.body.positions).toBeTruthy();
             }
+        });
+
+        it('should trade sell with no position', async () => {
+            const res = await request(app)
+                .post('/api/brokerage/trade')
+                .set('Authorization', `Bearer ${makeToken()}`)
+                .send({ symbol: 'GOOG', type: 'sell', quantity: 10, price: 100 });
+            expect([400, 500]).toContain(res.status);
+        });
+
+        it('should trade buy with existing position', async () => {
+            db.get.mockResolvedValueOnce({
+                exists: true,
+                data: () => ({ positions: [{ stock_symbol: 'AAPL', quantity: 5, averagePrice: 150 }] })
+            });
+            const res = await request(app)
+                .post('/api/brokerage/trade')
+                .set('Authorization', `Bearer ${makeToken()}`)
+                .send({ symbol: 'AAPL', type: 'buy', quantity: 10, price: 185.50 });
+            expect([201, 500]).toContain(res.status);
         });
     });
 });

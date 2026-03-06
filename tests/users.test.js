@@ -1,6 +1,4 @@
-/**
- * Test suite for user endpoints
- */
+
 const request = require('supertest');
 const { app } = require('../app');
 const jwt = require('jsonwebtoken');

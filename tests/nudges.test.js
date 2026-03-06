@@ -1,9 +1,29 @@
-/**
- * Test suite for nudge and alert endpoints
- */
+
 const request = require('supertest');
 const { app } = require('../app');
 const jwt = require('jsonwebtoken');
+
+jest.mock('firebase-admin', () => {
+    const mockFirestore = {
+        collection: jest.fn().mockReturnThis(),
+        doc: jest.fn().mockReturnThis(),
+        where: jest.fn().mockReturnThis(),
+        orderBy: jest.fn().mockReturnThis(),
+        limit: jest.fn().mockReturnThis(),
+        get: jest.fn(() => ({ empty: true, docs: [] })),
+        add: jest.fn(() => ({ id: 'mock-id' })),
+        update: jest.fn()
+    };
+    const mockFirestoreFn = jest.fn(() => mockFirestore);
+    mockFirestoreFn.FieldValue = { serverTimestamp: jest.fn(() => 'timestamp') };
+    return {
+        apps: ['mockApp'],
+        credential: { cert: jest.fn() },
+        initializeApp: jest.fn(),
+        firestore: mockFirestoreFn,
+        auth: jest.fn(() => ({}))
+    };
+});
 
 const JWT_SECRET = process.env.JWT_SECRET || 'test-secret';
 
