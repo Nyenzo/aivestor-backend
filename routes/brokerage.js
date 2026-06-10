@@ -1,20 +1,20 @@
 const express = require('express');
 const admin = require('firebase-admin');
 const { authenticateToken } = require('../middleware/auth');
+const { fetchMarketData } = require('../services/marketData');
 
 const router = express.Router();
 const db = admin.firestore();
 
-// ── Mock brokerage data ─────────────────────────────────────────────────────
-const MOCK_BROKERAGE_PORTFOLIO = [
-    { stock_symbol: 'AAPL', quantity: 15, averagePrice: 175.50, currentPrice: 182.30 },
-    { stock_symbol: 'MSFT', quantity: 10, averagePrice: 340.00, currentPrice: 365.20 },
-    { stock_symbol: 'GOOGL', quantity: 8, averagePrice: 140.00, currentPrice: 148.75 },
-    { stock_symbol: 'NVDA', quantity: 5, averagePrice: 450.00, currentPrice: 892.11 },
-    { stock_symbol: 'AMZN', quantity: 12, averagePrice: 155.00, currentPrice: 178.45 }
+const DEFAULT_BROKERAGE_POSITIONS = [
+    { stock_symbol: 'AAPL', quantity: 15 },
+    { stock_symbol: 'MSFT', quantity: 10 },
+    { stock_symbol: 'GOOGL', quantity: 8 },
+    { stock_symbol: 'NVDA', quantity: 5 },
+    { stock_symbol: 'AMZN', quantity: 12 }
 ];
 
-// POST /api/brokerage/connect — connect (mock) brokerage
+// POST /api/brokerage/connect — connect brokerage credentials
 router.post('/connect', authenticateToken, async (req, res) => {
     const { brokerName, apiKey } = req.body;
     if (!brokerName) return res.status(400).json({ error: 'brokerName is required' });
@@ -22,7 +22,7 @@ router.post('/connect', authenticateToken, async (req, res) => {
         const data = {
             user_id: req.user.uid,
             brokerName,
-            apiKey: apiKey || 'mock-key-****',
+            apiKey: apiKey || null,
             status: 'connected',
             connectedAt: admin.firestore.FieldValue.serverTimestamp()
         };
@@ -70,7 +70,7 @@ router.delete('/disconnect', authenticateToken, async (req, res) => {
     }
 });
 
-// POST /api/brokerage/sync — sync portfolio from brokerage
+// POST /api/brokerage/sync — sync portfolio prices from Yahoo Finance
 router.post('/sync', authenticateToken, async (req, res) => {
     try {
         const snap = await db.collection('brokerageConnections')
@@ -79,22 +79,43 @@ router.post('/sync', authenticateToken, async (req, res) => {
             .limit(1).get();
         if (snap.empty) return res.status(400).json({ error: 'No connected brokerage' });
 
-        // Simulate syncing positions from brokerage
         const portfolioRef = db.collection('portfolios').doc(req.user.uid);
+        const existingPortfolio = await portfolioRef.get();
+        const existingPositions = existingPortfolio.exists ? (existingPortfolio.data().positions || []) : [];
+        const basePositions = existingPositions.length ? existingPositions : DEFAULT_BROKERAGE_POSITIONS;
+        const symbols = basePositions.map((position) => position.stock_symbol);
+        const marketData = await fetchMarketData(symbols, { force: true });
+        const quotesBySymbol = new Map(marketData.quotes.map((quote) => [quote.symbol, quote]));
+
+        const positions = basePositions.map((position) => {
+            const quote = quotesBySymbol.get(position.stock_symbol);
+            const currentPrice = quote?.price ?? position.currentPrice ?? position.averagePrice ?? 0;
+            return {
+                ...position,
+                averagePrice: position.averagePrice ?? currentPrice,
+                currentPrice,
+                dailyChange: quote?.change ?? 0,
+                dailyChangePercent: quote?.changePercent ?? 0,
+                currency: quote?.currency ?? 'USD',
+                priceSource: marketData.source || 'yahoo-finance',
+                priceTimestamp: quote?.timestamp ?? marketData.asOf
+            };
+        });
+
         await portfolioRef.set({
             userId: req.user.uid,
-            positions: MOCK_BROKERAGE_PORTFOLIO,
+            positions,
             syncedAt: admin.firestore.FieldValue.serverTimestamp(),
             updatedAt: admin.firestore.FieldValue.serverTimestamp()
         }, { merge: true });
 
-        res.json({ message: 'Portfolio synced', positions: MOCK_BROKERAGE_PORTFOLIO });
+        res.json({ message: 'Portfolio synced', positions, source: marketData.source || 'yahoo-finance', asOf: marketData.asOf });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
 });
 
-// POST /api/brokerage/trade — simulate a trade
+// POST /api/brokerage/trade — record a trade
 router.post('/trade', authenticateToken, async (req, res) => {
     const { symbol, type, quantity, price } = req.body;
     if (!symbol || !type || !quantity || !price) {

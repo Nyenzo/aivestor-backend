@@ -3,6 +3,7 @@ const { app } = require('./app');
 const http = require('http');
 const { Server } = require('socket.io');
 const schedule = require('node-schedule');
+const { DEFAULT_STREAM_SYMBOLS, fetchMarketData } = require('./services/marketData');
 
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: '*' } });
@@ -15,21 +16,32 @@ io.on('connection', (socket) => {
 // Emit price update to all connected clients
 function emitPriceUpdate(data) { io.emit('price_update', data); }
 
-// Mock price emitter runs every 30 seconds for demo purposes
-const DEMO_TICKERS = ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'TSLA', 'META', 'AMD'];
+async function broadcastLivePrices() {
+  try {
+    const data = await fetchMarketData(DEFAULT_STREAM_SYMBOLS, { force: true });
+    data.quotes.forEach((quote) => {
+      emitPriceUpdate({
+        ticker: quote.symbol,
+        symbol: quote.symbol,
+        name: quote.name,
+        price: quote.price,
+        change: quote.change,
+        changePercent: quote.changePercent,
+        currency: quote.currency,
+        source: quote.source,
+        timestamp: quote.timestamp || data.asOf,
+      });
+    });
+  } catch (err) {
+    console.error('Live market broadcast failed:', err.message);
+  }
+}
 
-schedule.scheduleJob('*/30 * * * * *', () => {
-  const ticker = DEMO_TICKERS[Math.floor(Math.random() * DEMO_TICKERS.length)];
-  const basePrice = 150 + Math.random() * 700;
-  const change = (Math.random() - 0.5) * 10;
-  emitPriceUpdate({
-    ticker,
-    price: parseFloat(basePrice.toFixed(2)),
-    change: parseFloat(change.toFixed(2)),
-    changePercent: parseFloat(((change / basePrice) * 100).toFixed(2)),
-    timestamp: new Date().toISOString()
-  });
+io.on('connection', () => {
+  broadcastLivePrices();
 });
+
+schedule.scheduleJob('*/30 * * * * *', broadcastLivePrices);
 
 const PORT = process.env.PORT || 5000;
 server.listen(PORT, () => console.log(`Server running on port ${PORT} with WebSocket support`));

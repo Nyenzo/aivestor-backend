@@ -5,12 +5,33 @@ const admin = require('firebase-admin');
 const jwt = require('jsonwebtoken');
 const axios = require('axios');
 const predictionsRouter = require('./routes/predictions');
+const marketRouter = require('./routes/market');
 const { authenticateToken, JWT_SECRET } = require('./middleware/auth');
 
 const app = express();
 
+const configuredCorsOrigins = (process.env.CORS_ORIGIN || '')
+  .split(',')
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+const allowedCorsOrigins = Array.from(new Set([
+  ...configuredCorsOrigins,
+  'http://localhost:3000',
+  'http://localhost:3001',
+  'http://localhost:3002',
+  'http://127.0.0.1:3000',
+  'http://127.0.0.1:3001',
+  'http://127.0.0.1:3002',
+]));
+
 const corsOptions = {
-  origin: process.env.CORS_ORIGIN || 'http://localhost:3000',
+  origin(origin, callback) {
+    if (!origin || allowedCorsOrigins.includes(origin)) {
+      callback(null, true);
+      return;
+    }
+    callback(null, false);
+  },
   credentials: true,
   optionsSuccessStatus: 200
 };
@@ -20,7 +41,14 @@ app.use(express.json());
 // Firebase Admin init (guard for tests)
 if (!admin.apps.length) {
   try {
-    const serviceAccount = require('./aivestor-firebase-adminsdk.json');
+    let serviceAccount;
+    if (process.env.FIREBASE_SERVICE_ACCOUNT_B64) {
+      serviceAccount = JSON.parse(Buffer.from(process.env.FIREBASE_SERVICE_ACCOUNT_B64, 'base64').toString('utf8'));
+    } else if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
+      serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
+    } else {
+      serviceAccount = require('./aivestor-firebase-adminsdk.json');
+    }
     admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
   } catch (err) {
     if (process.env.NODE_ENV !== 'test') {
@@ -33,8 +61,10 @@ if (!admin.apps.length) {
 const db = admin.firestore();
 
 const AI_SERVICE_URL = process.env.AI_SERVICE_URL || 'http://localhost:5001';
+const FIREBASE_WEB_API_KEY = process.env.FIREBASE_WEB_API_KEY || process.env.NEXT_PUBLIC_FIREBASE_API_KEY;
 const DEFAULT_ONBOARDING_TICKERS = (process.env.ONBOARDING_TICKERS || 'SPY,QQQ,VTI,VXUS,BND')
   .split(',').map(t => t.trim()).filter(Boolean);
+const FIRESTORE_TIMEOUT_MS = Number(process.env.FIRESTORE_TIMEOUT_MS || 3000);
 
 // In-memory token stores (use Redis in production)
 const resetTokens = new Map();
@@ -50,10 +80,24 @@ const mapRiskLevelToTolerance = (level = '') => {
   }
 };
 
+const withFirestoreTimeout = (operation, label) => {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`${label} timed out after ${FIRESTORE_TIMEOUT_MS}ms`)),
+      FIRESTORE_TIMEOUT_MS
+    );
+  });
+  return Promise.race([operation, timeout]).finally(() => clearTimeout(timer));
+};
+
 // Look up user doc by email field
 const getUserByEmail = async (email) => {
   if (!email) return null;
-  const snap = await db.collection('users').where('email', '==', email).limit(1).get();
+  const snap = await withFirestoreTimeout(
+    db.collection('users').where('email', '==', email).limit(1).get(),
+    'Firestore user lookup'
+  );
   if (snap.empty) return null;
   const doc = snap.docs[0];
   return { id: doc.id, ...doc.data() };
@@ -80,6 +124,7 @@ const ensureUserRecord = async (email, riskLevel) => {
 // Root
 app.get('/', (_req, res) => res.send('Aivestor Backend API'));
 app.use('/api', predictionsRouter);
+app.use('/api/market', marketRouter);
 
 // Lazy-load brokerage router to avoid circular dependency
 app.use('/api/brokerage', (req, res, next) => {
@@ -90,7 +135,7 @@ app.use('/api/brokerage', (req, res, next) => {
 // Firestore connectivity check
 app.get('/api/test', async (_req, res) => {
   try {
-    const snap = await db.collection('users').limit(1).get();
+    const snap = await withFirestoreTimeout(db.collection('users').limit(1).get(), 'Firestore test query');
     res.json({ message: 'Firestore connected', docCount: snap.size });
   } catch (err) {
     res.status(500).json({ message: 'Firestore error', error: err.message });
@@ -100,7 +145,7 @@ app.get('/api/test', async (_req, res) => {
 // Health check
 app.get('/healthz', async (_req, res) => {
   try {
-    await db.collection('users').limit(1).get();
+    await withFirestoreTimeout(db.collection('users').limit(1).get(), 'Firestore health query');
     res.json({ ok: true, time: new Date().toISOString() });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
@@ -136,9 +181,19 @@ app.post('/api/auth/login', async (req, res) => {
     return res.status(400).json({ error: 'Email and password are required' });
   }
   try {
-    const userRecord = await admin.auth().getUserByEmail(email);
-    const user = await ensureUserRecord(userRecord.email);
-    const jwtToken = jwt.sign({ uid: userRecord.uid, email: userRecord.email }, JWT_SECRET, { expiresIn: '1h' });
+    if (!FIREBASE_WEB_API_KEY && process.env.NODE_ENV !== 'test') {
+      return res.status(500).json({ error: 'Firebase web API key is not configured' });
+    }
+    const authResponse = await axios.post(
+      `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${FIREBASE_WEB_API_KEY || 'test-key'}`,
+      { email, password, returnSecureToken: true },
+      { timeout: 10000 }
+    );
+    const firebaseUser = authResponse.data || {};
+    const userEmail = firebaseUser.email || email;
+    const uid = firebaseUser.localId || firebaseUser.uid;
+    const user = await ensureUserRecord(userEmail);
+    const jwtToken = jwt.sign({ uid, email: userEmail }, JWT_SECRET, { expiresIn: '1h' });
     res.json({ message: 'Login successful', token: jwtToken, user });
   } catch (err) {
     console.error(err.stack);
@@ -175,7 +230,7 @@ app.post('/api/auth/forgot-password', async (req, res) => {
     const resetToken = jwt.sign({ email, purpose: 'reset' }, JWT_SECRET, { expiresIn: '1h' });
     resetTokens.set(resetToken, { email, createdAt: Date.now() });
     console.log(`Password reset token for ${email}: ${resetToken}`);
-    res.json({ message: 'If the email exists, a reset link will be sent', token: resetToken });
+    res.json({ message: 'If the email exists, a reset link will be sent' });
   } catch (err) {
     console.error(err.stack);
     res.status(500).json({ error: 'Failed to process password reset' });
@@ -213,7 +268,7 @@ app.post('/api/auth/send-verification', authenticateToken, async (req, res) => {
     const verifyToken = jwt.sign({ email, purpose: 'verify' }, JWT_SECRET, { expiresIn: '24h' });
     verificationTokens.set(verifyToken, { email, createdAt: Date.now() });
     console.log(`Verification token for ${email}: ${verifyToken}`);
-    res.json({ message: 'Verification email sent', token: verifyToken });
+    res.json({ message: 'Verification email sent' });
   } catch (err) {
     console.error(err.stack);
     res.status(500).json({ error: 'Failed to send verification email' });
@@ -277,7 +332,7 @@ app.post('/api/users', authenticateToken, async (req, res) => {
 
 app.get('/api/users', authenticateToken, async (_req, res) => {
   try {
-    const snap = await db.collection('users').get();
+    const snap = await withFirestoreTimeout(db.collection('users').get(), 'Firestore users list');
     res.json(snap.docs.map(d => ({ id: d.id, ...d.data() })));
   } catch (err) {
     res.status(500).json({ error: err.message });
