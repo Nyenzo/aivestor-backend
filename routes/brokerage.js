@@ -1,5 +1,5 @@
 const express = require('express');
-const admin = require('firebase-admin');
+const admin = require('../services/firebaseAdmin');
 const { authenticateToken } = require('../middleware/auth');
 const { fetchMarketData } = require('../services/marketData');
 
@@ -48,6 +48,27 @@ router.get('/status', authenticateToken, async (req, res) => {
         const snap = await db.collection('brokerageConnections')
             .where('user_id', '==', req.user.uid).get();
         res.json(snap.docs.map(d => ({ id: d.id, ...d.data() })));
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// GET /api/brokerage/portfolio — read simulated portfolio positions for user
+router.get('/portfolio', authenticateToken, async (req, res) => {
+    try {
+        const portfolioRef = db.collection('portfolios').doc(req.user.uid);
+        const portfolioSnap = await portfolioRef.get();
+        if (!portfolioSnap.exists) {
+            return res.json({ userId: req.user.uid, positions: [] });
+        }
+        const portfolio = portfolioSnap.data() || {};
+        res.json({
+            id: portfolioSnap.id,
+            userId: portfolio.userId || portfolio.user_id || req.user.uid,
+            positions: portfolio.positions || [],
+            syncedAt: portfolio.syncedAt || null,
+            updatedAt: portfolio.updatedAt || null
+        });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }

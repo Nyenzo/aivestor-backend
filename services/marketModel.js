@@ -11,18 +11,19 @@ const SECTOR_DEFINITIONS = [
 function buildMarketModel(data, options = {}) {
   const quotes = Array.isArray(data?.quotes) ? data.quotes : [];
   const riskLevel = String(options.riskLevel || 'medium').toLowerCase();
+  const source = data?.source || 'market data';
   const sectors = buildSectorHeatmap(quotes);
   const sentiment = buildSentiment(quotes, sectors);
   const tradeSuggestions = buildTradeSuggestions(quotes, riskLevel);
-  const notifications = buildNotifications(quotes, sectors, tradeSuggestions);
+  const notifications = buildNotifications(quotes, sectors, tradeSuggestions, source);
 
   return {
     asOf: data?.asOf || new Date().toISOString(),
-    source: data?.source || 'yahoo-finance',
+    source,
     model: {
       name: 'Aivestor Market Pulse',
       version: 'market-trend-js-v1',
-      inputs: ['Yahoo Finance quotes', 'cross-asset momentum', 'sector breadth', 'risk tolerance'],
+      inputs: [`${source} quotes`, 'cross-asset momentum', 'sector breadth', 'risk tolerance'],
     },
     summary: buildSummary(quotes, sectors, sentiment, riskLevel),
     sectors,
@@ -106,7 +107,7 @@ function buildTradeSuggestions(quotes, riskLevel) {
     });
 }
 
-function buildNotifications(quotes, sectors, tradeSuggestions) {
+function buildNotifications(quotes, sectors, tradeSuggestions, source = 'market data') {
   const movers = [...quotes].sort((a, b) => Math.abs(b.changePercent || 0) - Math.abs(a.changePercent || 0)).slice(0, 4);
   const sector = [...sectors].sort((a, b) => Math.abs(b.changePercent) - Math.abs(a.changePercent))[0];
   const suggestions = tradeSuggestions.slice(0, 2).map((suggestion) => ({
@@ -121,7 +122,7 @@ function buildNotifications(quotes, sectors, tradeSuggestions) {
       type: 'market-move',
       severity: quote.changePercent >= 0 ? 'opportunity' : 'risk',
       title: `${displaySymbol(quote.symbol)} moved ${formatSigned(quote.changePercent)}`,
-      message: `${quote.name || quote.symbol} is trading at ${formatPrice(quote.price)} from Yahoo Finance.`,
+      message: `${quote.name || quote.symbol} is trading at ${formatPrice(quote.price)} from ${sourceLabel(source)}.`,
     })),
     ...(sector ? [{
       type: 'sector-breadth',
@@ -131,6 +132,12 @@ function buildNotifications(quotes, sectors, tradeSuggestions) {
     }] : []),
     ...suggestions,
   ].slice(0, 7);
+}
+
+function sourceLabel(source = '') {
+  if (/finnhub/i.test(source)) return 'Finnhub';
+  if (/yahoo/i.test(source)) return 'Yahoo Finance';
+  return 'market data';
 }
 
 function buildSummary(quotes, sectors, sentiment, riskLevel) {

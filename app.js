@@ -1,51 +1,34 @@
-require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const admin = require('firebase-admin');
+const cookieParser = require('cookie-parser');
+const admin = require('./services/firebaseAdmin');
 const jwt = require('jsonwebtoken');
 const axios = require('axios');
 const predictionsRouter = require('./routes/predictions');
 const marketRouter = require('./routes/market');
+const { config } = require('./config/env');
 const { authenticateToken, JWT_SECRET } = require('./middleware/auth');
+const { apiRateLimiter, authRateLimiter, corsOptions, securityHeaders } = require('./middleware/security');
+const { createTokenStore } = require('./services/tokenStore');
 
 const app = express();
 
-const configuredCorsOrigins = (process.env.CORS_ORIGIN || '')
-  .split(',')
-  .map((origin) => origin.trim())
-  .filter(Boolean);
-const allowedCorsOrigins = Array.from(new Set([
-  ...configuredCorsOrigins,
-  'http://localhost:3000',
-  'http://localhost:3001',
-  'http://localhost:3002',
-  'http://127.0.0.1:3000',
-  'http://127.0.0.1:3001',
-  'http://127.0.0.1:3002',
-]));
-
-const corsOptions = {
-  origin(origin, callback) {
-    if (!origin || allowedCorsOrigins.includes(origin)) {
-      callback(null, true);
-      return;
-    }
-    callback(null, false);
-  },
-  credentials: true,
-  optionsSuccessStatus: 200
-};
+app.disable('x-powered-by');
+app.use(securityHeaders);
 app.use(cors(corsOptions));
-app.use(express.json());
+app.use(cookieParser());
+app.use(express.json({ limit: config.jsonBodyLimit }));
+app.use('/api/auth', authRateLimiter);
+app.use('/api', apiRateLimiter);
 
 // Firebase Admin init (guard for tests)
-if (!admin.apps.length) {
+if (!admin.hasApps()) {
   try {
     let serviceAccount;
-    if (process.env.FIREBASE_SERVICE_ACCOUNT_B64) {
-      serviceAccount = JSON.parse(Buffer.from(process.env.FIREBASE_SERVICE_ACCOUNT_B64, 'base64').toString('utf8'));
-    } else if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
-      serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
+    if (config.firebaseServiceAccountB64) {
+      serviceAccount = JSON.parse(Buffer.from(config.firebaseServiceAccountB64, 'base64').toString('utf8'));
+    } else if (config.firebaseServiceAccountJson) {
+      serviceAccount = JSON.parse(config.firebaseServiceAccountJson);
     } else {
       serviceAccount = require('./aivestor-firebase-adminsdk.json');
     }
@@ -60,15 +43,31 @@ if (!admin.apps.length) {
 // Firestore reference
 const db = admin.firestore();
 
-const AI_SERVICE_URL = process.env.AI_SERVICE_URL || 'http://localhost:5001';
-const FIREBASE_WEB_API_KEY = process.env.FIREBASE_WEB_API_KEY || process.env.NEXT_PUBLIC_FIREBASE_API_KEY;
+const AI_SERVICE_URL = config.aiServiceUrl;
+const FIREBASE_WEB_API_KEY = config.firebaseWebApiKey;
 const DEFAULT_ONBOARDING_TICKERS = (process.env.ONBOARDING_TICKERS || 'SPY,QQQ,VTI,VXUS,BND')
   .split(',').map(t => t.trim()).filter(Boolean);
 const FIRESTORE_TIMEOUT_MS = Number(process.env.FIRESTORE_TIMEOUT_MS || 3000);
 
-// In-memory token stores (use Redis in production)
-const resetTokens = new Map();
-const verificationTokens = new Map();
+const tokenStore = createTokenStore({ db, mode: config.tokenStore });
+
+const authCookieOptions = {
+  httpOnly: true,
+  secure: config.isProduction,
+  sameSite: config.isProduction ? 'none' : 'lax',
+  path: '/',
+};
+
+const setAuthCookie = (res, token) => {
+  res.cookie('aivestor_session', token, {
+    ...authCookieOptions,
+    maxAge: 60 * 60 * 1000,
+  });
+};
+
+const clearAuthCookie = (res) => {
+  res.clearCookie('aivestor_session', authCookieOptions);
+};
 
 // Risk level to numeric tolerance
 const mapRiskLevelToTolerance = (level = '') => {
@@ -194,6 +193,7 @@ app.post('/api/auth/login', async (req, res) => {
     const uid = firebaseUser.localId || firebaseUser.uid;
     const user = await ensureUserRecord(userEmail);
     const jwtToken = jwt.sign({ uid, email: userEmail }, JWT_SECRET, { expiresIn: '1h' });
+    setAuthCookie(res, jwtToken);
     res.json({ message: 'Login successful', token: jwtToken, user });
   } catch (err) {
     console.error(err.stack);
@@ -211,6 +211,7 @@ app.post('/api/auth/google', async (req, res) => {
     const decoded = await admin.auth().verifyIdToken(idToken);
     const user = await ensureUserRecord(decoded.email);
     const jwtToken = jwt.sign({ uid: decoded.uid, email: decoded.email }, JWT_SECRET, { expiresIn: '1h' });
+    setAuthCookie(res, jwtToken);
     res.json({ message: 'Google login successful', token: jwtToken, user });
   } catch (err) {
     console.error(err.stack);
@@ -228,8 +229,7 @@ app.post('/api/auth/forgot-password', async (req, res) => {
     const user = await getUserByEmail(email);
     if (!user) return res.json({ message: 'If the email exists, a reset link will be sent' });
     const resetToken = jwt.sign({ email, purpose: 'reset' }, JWT_SECRET, { expiresIn: '1h' });
-    resetTokens.set(resetToken, { email, createdAt: Date.now() });
-    console.log(`Password reset token for ${email}: ${resetToken}`);
+    await tokenStore.save('reset', resetToken, { email }, Date.now() + 60 * 60 * 1000);
     res.json({ message: 'If the email exists, a reset link will be sent' });
   } catch (err) {
     console.error(err.stack);
@@ -246,10 +246,12 @@ app.post('/api/auth/reset-password', async (req, res) => {
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
     if (decoded.purpose !== 'reset') return res.status(400).json({ error: 'Invalid reset token' });
-    if (!resetTokens.has(token)) return res.status(400).json({ error: 'Token has expired or been used' });
+    const stored = await tokenStore.consume('reset', token);
+    if (!stored || stored.email !== decoded.email) {
+      return res.status(400).json({ error: 'Token has expired or been used' });
+    }
     const userRecord = await admin.auth().getUserByEmail(decoded.email);
     await admin.auth().updateUser(userRecord.uid, { password });
-    resetTokens.delete(token);
     res.json({ message: 'Password reset successful' });
   } catch (err) {
     if (err.name === 'JsonWebTokenError' || err.name === 'TokenExpiredError') {
@@ -266,8 +268,7 @@ app.post('/api/auth/send-verification', authenticateToken, async (req, res) => {
     const email = req.user?.email;
     if (!email) return res.status(400).json({ error: 'Email not found' });
     const verifyToken = jwt.sign({ email, purpose: 'verify' }, JWT_SECRET, { expiresIn: '24h' });
-    verificationTokens.set(verifyToken, { email, createdAt: Date.now() });
-    console.log(`Verification token for ${email}: ${verifyToken}`);
+    await tokenStore.save('verify', verifyToken, { email }, Date.now() + 24 * 60 * 60 * 1000);
     res.json({ message: 'Verification email sent' });
   } catch (err) {
     console.error(err.stack);
@@ -282,12 +283,14 @@ app.post('/api/auth/verify-email', async (req, res) => {
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
     if (decoded.purpose !== 'verify') return res.status(400).json({ error: 'Invalid verification token' });
-    if (!verificationTokens.has(token)) return res.status(400).json({ error: 'Token has expired or been used' });
+    const stored = await tokenStore.consume('verify', token);
+    if (!stored || stored.email !== decoded.email) {
+      return res.status(400).json({ error: 'Token has expired or been used' });
+    }
     const userRecord = await admin.auth().getUserByEmail(decoded.email);
     await admin.auth().updateUser(userRecord.uid, { emailVerified: true });
     const userDoc = await getUserByEmail(decoded.email);
     if (userDoc) await db.collection('users').doc(userDoc.id).update({ email_verified: true });
-    verificationTokens.delete(token);
     res.json({ message: 'Email verified successfully' });
   } catch (err) {
     if (err.name === 'JsonWebTokenError' || err.name === 'TokenExpiredError') {
@@ -304,11 +307,17 @@ app.post('/api/auth/refresh', authenticateToken, async (req, res) => {
     const { email, uid } = req.user || {};
     if (!email || !uid) return res.status(400).json({ error: 'Invalid token data' });
     const newToken = jwt.sign({ uid, email }, JWT_SECRET, { expiresIn: '1h' });
+    setAuthCookie(res, newToken);
     res.json({ token: newToken, message: 'Token refreshed successfully' });
   } catch (err) {
     console.error(err.stack);
     res.status(500).json({ error: 'Failed to refresh token' });
   }
+});
+
+app.post('/api/auth/logout', (_req, res) => {
+  clearAuthCookie(res);
+  res.json({ message: 'Logged out' });
 });
 
 // ── User CRUD ───────────────────────────────────────────────────────────────

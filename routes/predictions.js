@@ -3,11 +3,12 @@ const axios = require('axios');
 const jwt = require('jsonwebtoken');
 const { DEFAULT_MARKET_SYMBOLS, fetchMarketData, normalizeSymbols } = require('../services/marketData');
 const { buildTradeSuggestions } = require('../services/marketModel');
+const { JWT_SECRET } = require('../middleware/auth');
+const { config } = require('../config/env');
 const router = express.Router();
 
 // Configuring the AI service URL and JWT secret
-const AI_SERVICE_URL = process.env.AI_SERVICE_URL || 'http://localhost:5001';
-const JWT_SECRET = process.env.JWT_SECRET || 'your-very-secure-secret-key';
+const AI_SERVICE_URL = config.aiServiceUrl;
 
 // Route to get AI prediction for a single ticker
 router.get('/predict/:ticker', async (req, res) => {
@@ -43,7 +44,7 @@ router.post('/chat', async (req, res) => {
     }
     try {
         const token = jwt.sign({ service: 'backend' }, JWT_SECRET, { expiresIn: '1h' });
-        const response = await axios.post(`${AI_SERVICE_URL}/chat`, { message }, {
+        const response = await axios.post(`${AI_SERVICE_URL}/chat`, { message, query: message }, {
             headers: { Authorization: `Bearer ${token}` }
         });
         res.json(response.data);
