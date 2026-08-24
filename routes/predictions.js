@@ -25,11 +25,15 @@ router.get('/predict/:ticker', async (req, res) => {
 });
 
 router.get('/history/:ticker', async (req, res) => {
+    const allowedPeriods = new Set(['5d', '1mo', '3mo', '6mo', '1y', '2y', '5y', '10y', 'ytd', 'max']);
+    const period = allowedPeriods.has(req.query.period) ? req.query.period : '1y';
     try {
         const token = jwt.sign({ service: 'backend' }, JWT_SECRET, { expiresIn: '1h' });
         const response = await axios.get(`${AI_SERVICE_URL}/history/${req.params.ticker}`, {
-            headers: { Authorization: `Bearer ${token}` }
+            headers: { Authorization: `Bearer ${token}` },
+            params: { period },
         });
+        res.set('Cache-Control', 'public, max-age=60, stale-while-revalidate=300');
         res.json(response.data);
     } catch (error) {
         console.error(`Error fetching history for ${req.params.ticker}:`, error.message);

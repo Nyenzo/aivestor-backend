@@ -122,9 +122,14 @@ describe('Predictions API Endpoints', () => {
         it('returns history from AI', async () => {
             axios.get.mockResolvedValueOnce({ data: { history: [1, 2, 3] } });
             const res = await request(app)
-                .get('/api/history/AAPL')
+                .get('/api/history/AAPL?period=1mo')
                 .set('Authorization', `Bearer ${token}`);
             expect(res.status).toBe(200);
+            expect(axios.get).toHaveBeenCalledWith(
+                expect.stringContaining('/history/AAPL'),
+                expect.objectContaining({ params: { period: '1mo' } })
+            );
+            expect(res.headers['cache-control']).toContain('max-age=60');
         });
 
         it('handles AI service error', async () => {

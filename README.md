@@ -80,6 +80,17 @@ The server broadcasts via Socket.IO:
 |-------|---------|-----------|
 | `price_update` | `{ ticker, price, change, changePercent, timestamp }` | Every 30s |
 
+## Market Data Caching
+
+Market quote endpoints use a two-layer cache:
+
+| Layer | Purpose |
+|-------|---------|
+| In-memory TTL cache | Fast local cache for the active Node process |
+| Upstash Redis REST cache | Shared production cache across deploys/instances |
+
+Set `UPSTASH_REDIS_REST_URL` and `UPSTASH_REDIS_REST_TOKEN` to enable Redis caching. If Redis is unavailable, the backend falls back to memory cache and live provider fetches without exposing secrets in logs.
+
 ## Testing
 
 ```bash

@@ -1,6 +1,7 @@
 const express = require('express');
-const { DEFAULT_MARKET_SYMBOLS, fetchMarketData, normalizeSymbols } = require('../services/marketData');
+const { DEFAULT_MARKET_SYMBOLS, fetchMarketData, normalizeSymbols, searchMarketSymbols } = require('../services/marketData');
 const { buildMarketModel, buildTradeSuggestions } = require('../services/marketModel');
+const { getAiTradeSuggestions } = require('../services/aiMarketModel');
 
 const router = express.Router();
 const HTTP_MAX_AGE_SECONDS = Number(process.env.MARKET_HTTP_MAX_AGE_SECONDS || 15);
@@ -21,7 +22,7 @@ router.get('/summary', async (_req, res) => {
     const data = await fetchMarketData(DEFAULT_MARKET_SYMBOLS);
     sendMarketData(res, data);
   } catch (err) {
-    res.status(502).json({ error: 'Unable to fetch Yahoo Finance market data', detail: err.message });
+    res.status(502).json({ error: 'Unable to fetch market data', detail: err.message });
   }
 });
 
@@ -31,7 +32,19 @@ router.get('/quotes', async (req, res) => {
     const data = await fetchMarketData(symbols);
     sendMarketData(res, data);
   } catch (err) {
-    res.status(502).json({ error: 'Unable to fetch Yahoo Finance quotes', detail: err.message });
+    res.status(502).json({ error: 'Unable to fetch market quotes', detail: err.message });
+  }
+});
+
+router.get('/search', async (req, res) => {
+  const query = String(req.query.q || req.query.query || '').trim();
+  if (query.length < 2) return res.status(400).json({ error: 'Search query must contain at least two characters' });
+  try {
+    const results = await searchMarketSymbols(query);
+    res.set('Cache-Control', 'public, max-age=60, stale-while-revalidate=600');
+    res.json({ query, source: 'finnhub', results });
+  } catch (err) {
+    res.status(502).json({ error: 'Market search is temporarily unavailable', detail: err.message });
   }
 });
 
@@ -39,7 +52,17 @@ router.get('/insights', async (req, res) => {
   try {
     const symbols = normalizeSymbols(req.query.symbols || req.query.tickers || DEFAULT_MARKET_SYMBOLS);
     const data = await fetchMarketData(symbols);
-    const model = buildMarketModel(data, { riskLevel: req.query.riskLevel || req.query.risk_level });
+    const riskLevel = req.query.riskLevel || req.query.risk_level || 'medium';
+    let aiModel = null;
+    try {
+      aiModel = await getAiTradeSuggestions({ symbols, riskLevel, quotes: data.quotes });
+    } catch (_error) {
+      aiModel = null;
+    }
+    const model = buildMarketModel(data, { riskLevel, tradeSuggestions: aiModel?.suggestions });
+    if (aiModel?.model) {
+      model.model = { ...model.model, ai: { ...aiModel.model, cache: aiModel.cache } };
+    }
     sendMarketData(res, { ...model, cache: data.cache });
   } catch (err) {
     res.status(502).json({ error: 'Unable to generate Aivestor market insights', detail: err.message });
@@ -50,11 +73,18 @@ router.get('/trade-suggestions', async (req, res) => {
   try {
     const symbols = normalizeSymbols(req.query.symbols || req.query.tickers || DEFAULT_MARKET_SYMBOLS);
     const data = await fetchMarketData(symbols);
-    const suggestions = buildTradeSuggestions(data.quotes || [], req.query.riskLevel || req.query.risk_level || 'medium');
+    const riskLevel = req.query.riskLevel || req.query.risk_level || 'medium';
+    let aiModel = null;
+    try {
+      aiModel = await getAiTradeSuggestions({ symbols, riskLevel, quotes: data.quotes });
+    } catch (_error) {
+      aiModel = null;
+    }
+    const suggestions = aiModel?.suggestions || buildTradeSuggestions(data.quotes || [], riskLevel);
     sendMarketData(res, {
       asOf: data.asOf,
       source: data.source,
-      model: { name: 'Aivestor Trade Suggestions', version: 'market-trend-js-v1' },
+      model: aiModel?.model || { name: 'Aivestor Trade Suggestions', version: 'market-trend-js-v1' },
       suggestions,
       cache: data.cache,
     });

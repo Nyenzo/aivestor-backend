@@ -1,11 +1,14 @@
 const SECTOR_DEFINITIONS = [
-  { name: 'Technology', symbols: ['AAPL', 'MSFT', 'NVDA', 'GOOGL', 'META'], benchmark: 'XLK' },
-  { name: 'Consumer Discretionary', symbols: ['AMZN', 'TSLA'], benchmark: 'XLY' },
-  { name: 'Financials', symbols: ['JPM', 'BRK-B'], benchmark: 'XLF' },
-  { name: 'Broad Market', symbols: ['SPY', 'QQQ', '^GSPC', '^IXIC', '^DJI', '^RUT'], benchmark: 'SPY' },
-  { name: 'Volatility', symbols: ['^VIX'], benchmark: '^VIX' },
-  { name: 'Commodities', symbols: ['GC=F', 'SI=F', 'CL=F', 'NG=F'], benchmark: 'DBC' },
-  { name: 'Crypto', symbols: ['BTC-USD', 'ETH-USD'], benchmark: 'BTC-USD' },
+  { name: 'Technology', symbols: ['XLK', 'AAPL', 'MSFT', 'NVDA', 'GOOGL', 'META'], benchmark: 'XLK' },
+  { name: 'Consumer Discretionary', symbols: ['XLY', 'AMZN', 'TSLA'], benchmark: 'XLY' },
+  { name: 'Financials', symbols: ['XLF', 'JPM', 'BRK-B'], benchmark: 'XLF' },
+  { name: 'Health Care', symbols: ['XLV'], benchmark: 'XLV' },
+  { name: 'Energy', symbols: ['XLE'], benchmark: 'XLE' },
+  { name: 'Consumer Staples', symbols: ['XLP'], benchmark: 'XLP' },
+  { name: 'Industrials', symbols: ['XLI'], benchmark: 'XLI' },
+  { name: 'Materials', symbols: ['XLB'], benchmark: 'XLB' },
+  { name: 'Utilities', symbols: ['XLU'], benchmark: 'XLU' },
+  { name: 'Real Estate', symbols: ['XLRE'], benchmark: 'XLRE' },
 ];
 
 function buildMarketModel(data, options = {}) {
@@ -14,7 +17,9 @@ function buildMarketModel(data, options = {}) {
   const source = data?.source || 'market data';
   const sectors = buildSectorHeatmap(quotes);
   const sentiment = buildSentiment(quotes, sectors);
-  const tradeSuggestions = buildTradeSuggestions(quotes, riskLevel);
+  const tradeSuggestions = Array.isArray(options.tradeSuggestions) && options.tradeSuggestions.length
+    ? options.tradeSuggestions
+    : buildTradeSuggestions(quotes, riskLevel);
   const notifications = buildNotifications(quotes, sectors, tradeSuggestions, source);
 
   return {
@@ -25,7 +30,7 @@ function buildMarketModel(data, options = {}) {
       version: 'market-trend-js-v1',
       inputs: [`${source} quotes`, 'cross-asset momentum', 'sector breadth', 'risk tolerance'],
     },
-    summary: buildSummary(quotes, sectors, sentiment, riskLevel),
+    summary: buildSummary(quotes, sectors, sentiment, tradeSuggestions, riskLevel),
     sectors,
     sentiment,
     notifications,
@@ -140,11 +145,13 @@ function sourceLabel(source = '') {
   return 'market data';
 }
 
-function buildSummary(quotes, sectors, sentiment, riskLevel) {
+function buildSummary(quotes, sectors, sentiment, tradeSuggestions, riskLevel) {
   const top = [...sectors].sort((a, b) => b.changePercent - a.changePercent)[0];
   const weak = [...sectors].sort((a, b) => a.changePercent - b.changePercent)[0];
   const advancers = quotes.filter((quote) => Number(quote.changePercent) >= 0).length;
-  return `Aivestor Market Pulse is ${sentiment.label.toLowerCase()} with ${advancers}/${quotes.length} tracked markets advancing. ${top?.name || 'Leading sectors'} leads at ${formatSigned(top?.changePercent || 0)}, while ${weak?.name || 'the weakest group'} trails at ${formatSigned(weak?.changePercent || 0)}. For a ${riskLevel} risk profile, favor diversified exposure and use trade suggestions only where confidence and stop discipline align.`;
+  const suggestion = tradeSuggestions?.[0];
+  const modelReadout = suggestion ? ` The model flags ${displaySymbol(suggestion.symbol)} as ${String(suggestion.action).toLowerCase()}.` : '';
+  return `Aivestor Market Pulse is ${sentiment.label.toLowerCase()} with ${advancers}/${quotes.length} tracked markets advancing. ${top?.name || 'Leading sectors'} leads at ${formatSigned(top?.changePercent || 0)}, while ${weak?.name || 'the weakest group'} trails at ${formatSigned(weak?.changePercent || 0)}.${modelReadout} For a ${riskLevel} risk profile, maintain diversification and apply defined risk limits.`;
 }
 
 function compactQuote(quote) {

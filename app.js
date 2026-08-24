@@ -103,12 +103,13 @@ const getUserByEmail = async (email) => {
 };
 
 // Create user doc if missing, return existing otherwise
-const ensureUserRecord = async (email, riskLevel) => {
+const ensureUserRecord = async (email, riskLevel, displayName) => {
   const existing = await getUserByEmail(email);
   if (existing) return existing;
   const riskTolerance = mapRiskLevelToTolerance(riskLevel);
   const data = {
     email,
+    displayName: String(displayName || '').trim() || null,
     risk_tolerance: riskTolerance,
     risk_level: riskLevel || null,
     created_at: admin.firestore.FieldValue.serverTimestamp()
@@ -155,13 +156,13 @@ app.get('/healthz', async (_req, res) => {
 
 // Register with email/password
 app.post('/api/auth/register', async (req, res) => {
-  const { email, password, risk_tolerance } = req.body;
+  const { email, password, risk_tolerance, displayName } = req.body;
   if (!email || !password) {
     return res.status(400).json({ error: 'Email and password are required' });
   }
   try {
-    const userRecord = await admin.auth().createUser({ email, password });
-    const user = await ensureUserRecord(email);
+    const userRecord = await admin.auth().createUser({ email, password, ...(displayName ? { displayName } : {}) });
+    const user = await ensureUserRecord(email, undefined, displayName);
     if (typeof risk_tolerance === 'number') {
       await db.collection('users').doc(user.id).update({ risk_tolerance });
       user.risk_tolerance = risk_tolerance;
@@ -209,7 +210,7 @@ app.post('/api/auth/google', async (req, res) => {
   }
   try {
     const decoded = await admin.auth().verifyIdToken(idToken);
-    const user = await ensureUserRecord(decoded.email);
+    const user = await ensureUserRecord(decoded.email, undefined, decoded.name);
     const jwtToken = jwt.sign({ uid: decoded.uid, email: decoded.email }, JWT_SECRET, { expiresIn: '1h' });
     setAuthCookie(res, jwtToken);
     res.json({ message: 'Google login successful', token: jwtToken, user });

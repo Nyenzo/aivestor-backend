@@ -1,5 +1,6 @@
 const https = require('https');
 const axios = require('axios');
+const redisCache = require('./redisCache');
 require('dotenv').config();
 
 const DEFAULT_MARKET_SYMBOLS = [
@@ -19,12 +20,23 @@ const DEFAULT_MARKET_SYMBOLS = [
   '^IXIC',
   '^RUT',
   '^VIX',
-  'GC=F',
+  'GLD',
   'SI=F',
   'CL=F',
   'NG=F',
   'BTC-USD',
   'ETH-USD',
+  'SPCX',
+  'XLK',
+  'XLY',
+  'XLF',
+  'XLV',
+  'XLE',
+  'XLP',
+  'XLI',
+  'XLB',
+  'XLU',
+  'XLRE',
 ];
 
 const DEFAULT_STREAM_SYMBOLS = [
@@ -42,8 +54,11 @@ const DEFAULT_STREAM_SYMBOLS = [
 
 const cache = new Map();
 const inFlight = new Map();
-const CACHE_TTL_MS = Number(process.env.MARKET_DATA_CACHE_TTL_MS || 30000);
+const symbolSearchCache = new Map();
+const symbolSearchInFlight = new Map();
+const CACHE_TTL_MS = Number(process.env.MARKET_DATA_CACHE_TTL_MS || 45000);
 const STALE_TTL_MS = Number(process.env.MARKET_DATA_STALE_TTL_MS || 300000);
+const SYMBOL_SEARCH_CACHE_TTL_MS = Number(process.env.SYMBOL_SEARCH_CACHE_TTL_MS || 600000);
 const MARKET_DATA_TIMEOUT_MS = Number(process.env.MARKET_DATA_TIMEOUT_MS || 15000);
 const MARKET_FETCH_MAX_MS = Number(process.env.MARKET_FETCH_MAX_MS || 25000);
 const CHART_FALLBACK_SYMBOL_LIMIT = Number(process.env.MARKET_CHART_FALLBACK_SYMBOL_LIMIT || 8);
@@ -57,7 +72,9 @@ const FINNHUB_WS_URL = process.env.FINNHUB_WS_URL || 'wss://ws.finnhub.io';
 const FINNHUB_RATE_LIMIT_REQUESTS = Number(process.env.FINNHUB_RATE_LIMIT_REQUESTS || 55);
 const FINNHUB_RATE_LIMIT_WINDOW_MS = Number(process.env.FINNHUB_RATE_LIMIT_WINDOW_MS || 60000);
 const FINNHUB_RATE_LIMIT_COOLDOWN_MS = Number(process.env.FINNHUB_RATE_LIMIT_COOLDOWN_MS || 60000);
-const MARKET_DATA_ENABLE_YAHOO_FALLBACK = process.env.MARKET_DATA_ENABLE_YAHOO_FALLBACK === 'true';
+const FINNHUB_QUOTE_CONCURRENCY = Number(process.env.FINNHUB_QUOTE_CONCURRENCY || 12);
+const FINNHUB_QUOTE_TIMEOUT_MS = Number(process.env.FINNHUB_QUOTE_TIMEOUT_MS || Math.min(MARKET_DATA_TIMEOUT_MS, 3500));
+const MARKET_DATA_ENABLE_YAHOO_FALLBACK = process.env.MARKET_DATA_ENABLE_YAHOO_FALLBACK !== 'false';
 const YAHOO_QUOTE_URL = process.env.YAHOO_QUOTE_URL || 'https://query1.finance.yahoo.com/v7/finance/quote';
 const YAHOO_CHART_URL = process.env.YAHOO_CHART_URL || 'https://query1.finance.yahoo.com/v8/finance/chart';
 const httpsAgent = new https.Agent({ keepAlive: true, family: 4 });
@@ -83,12 +100,23 @@ const DISPLAY_NAMES = {
   '^IXIC': 'Nasdaq Composite',
   '^RUT': 'Russell 2000',
   '^VIX': 'VIX',
-  'GC=F': 'Gold Futures',
+  GLD: 'SPDR Gold Shares',
   'SI=F': 'Silver Futures',
   'CL=F': 'Crude Oil Futures',
   'NG=F': 'Natural Gas Futures',
   'BTC-USD': 'Bitcoin',
   'ETH-USD': 'Ethereum',
+  SPCX: 'SpaceX',
+  XLK: 'Technology Select Sector SPDR Fund',
+  XLY: 'Consumer Discretionary Select Sector SPDR Fund',
+  XLF: 'Financial Select Sector SPDR Fund',
+  XLV: 'Health Care Select Sector SPDR Fund',
+  XLE: 'Energy Select Sector SPDR Fund',
+  XLP: 'Consumer Staples Select Sector SPDR Fund',
+  XLI: 'Industrial Select Sector SPDR Fund',
+  XLB: 'Materials Select Sector SPDR Fund',
+  XLU: 'Utilities Select Sector SPDR Fund',
+  XLRE: 'Real Estate Select Sector SPDR Fund',
 };
 
 const FINNHUB_SYMBOL_MAP = {
@@ -103,6 +131,12 @@ const FINNHUB_SYMBOL_MAP = {
   'CL=F': 'OANDA:BCO_USD',
   'BTC-USD': 'BINANCE:BTCUSDT',
   'ETH-USD': 'BINANCE:ETHUSDT',
+};
+
+const CANONICAL_SEARCH_RESULTS = {
+  spacex: { symbol: 'SPCX', displaySymbol: 'SPCX', name: 'SpaceX', type: 'Common Stock' },
+  'space x': { symbol: 'SPCX', displaySymbol: 'SPCX', name: 'SpaceX', type: 'Common Stock' },
+  spcx: { symbol: 'SPCX', displaySymbol: 'SPCX', name: 'SpaceX', type: 'Common Stock' },
 };
 
 function normalizeSymbols(symbols) {
@@ -124,20 +158,110 @@ function cacheKey(symbols) {
   return normalizeSymbols(symbols).join(',');
 }
 
+function normalizeSearchQuery(query) {
+  return String(query || '').trim().replace(/\s+/g, ' ').slice(0, 64);
+}
+
+async function searchMarketSymbols(query) {
+  const normalizedQuery = normalizeSearchQuery(query);
+  if (normalizedQuery.length < 2) return [];
+
+  const key = normalizedQuery.toLowerCase();
+  const canonicalResult = CANONICAL_SEARCH_RESULTS[key];
+  if (canonicalResult) return [canonicalResult];
+
+  const memoryEntry = symbolSearchCache.get(key);
+  if (memoryEntry && Date.now() - memoryEntry.time < SYMBOL_SEARCH_CACHE_TTL_MS) {
+    return memoryEntry.results;
+  }
+  if (symbolSearchInFlight.has(key)) return symbolSearchInFlight.get(key);
+
+  const request = loadSymbolSearch(normalizedQuery, key, memoryEntry);
+  symbolSearchInFlight.set(key, request);
+  try {
+    return await request;
+  } finally {
+    symbolSearchInFlight.delete(key);
+  }
+}
+
+async function loadSymbolSearch(query, key, memoryEntry) {
+  const distributedEntry = await getDistributedSearchCache(key);
+  if (distributedEntry && Date.now() - distributedEntry.time < SYMBOL_SEARCH_CACHE_TTL_MS) {
+    symbolSearchCache.set(key, distributedEntry);
+    return distributedEntry.results;
+  }
+
+  if (!FINNHUB_API_KEY) {
+    throw new Error('Market search is unavailable because no market data provider is configured');
+  }
+
+  try {
+    const response = await runFinnhubRequest(() => axios.get(`${FINNHUB_BASE_URL}/search`, {
+      params: { q: query, exchange: 'US' },
+      timeout: MARKET_DATA_TIMEOUT_MS,
+      httpsAgent,
+      headers: {
+        Accept: 'application/json',
+        'X-Finnhub-Token': FINNHUB_API_KEY,
+        'User-Agent': 'Aivestor/1.0 (+https://aivestor.local)',
+      },
+      validateStatus: (status) => status >= 200 && status < 500,
+    }));
+
+    if (response.status === 429) {
+      setFinnhubCooldown();
+      throw new Error('Market search is temporarily rate limited');
+    }
+    if (response.status === 401 || response.status === 403) {
+      throw new Error('Market search provider authentication failed');
+    }
+    if (response.status >= 400) {
+      throw new Error('Market search is temporarily unavailable');
+    }
+
+    const providerResults = (response.data?.result || [])
+      .map(normalizeFinnhubSearchResult)
+      .filter(Boolean)
+      .slice(0, 12);
+    const aliasResult = CANONICAL_SEARCH_RESULTS[key];
+    const results = Array.from(new Map([
+      ...(aliasResult ? [[aliasResult.symbol, aliasResult]] : []),
+      ...providerResults.map((result) => [result.symbol, result]),
+    ]).values()).slice(0, 12);
+    const entry = { time: Date.now(), results };
+    symbolSearchCache.set(key, entry);
+    if (redisCache.isEnabled()) {
+      await redisCache.setJson(redisCache.buildCacheKey('market:search:v1', key), entry, SYMBOL_SEARCH_CACHE_TTL_MS);
+    }
+    return results;
+  } catch (error) {
+    if (memoryEntry && Date.now() - memoryEntry.time < STALE_TTL_MS) return memoryEntry.results;
+    if (distributedEntry && Date.now() - distributedEntry.time < STALE_TTL_MS) return distributedEntry.results;
+    throw error;
+  }
+}
+
+async function getDistributedSearchCache(key) {
+  if (!redisCache.isEnabled()) return null;
+  const entry = await redisCache.getJson(redisCache.buildCacheKey('market:search:v1', key));
+  return entry && Number.isFinite(Number(entry.time)) && Array.isArray(entry.results) ? entry : null;
+}
+
 async function fetchMarketData(symbols = DEFAULT_MARKET_SYMBOLS, options = {}) {
   const normalized = normalizeSymbols(symbols);
   const key = cacheKey(normalized);
   const cached = cache.get(key);
 
   if (!options.force && cached && Date.now() - cached.time < CACHE_TTL_MS) {
-    return { ...cached.data, cache: { status: 'hit', ageMs: Date.now() - cached.time, ttlMs: CACHE_TTL_MS } };
+    return withCacheMetadata(cached, 'hit', { layer: 'memory' });
   }
 
   if (!options.force && inFlight.has(key)) {
     return inFlight.get(key);
   }
 
-  const request = loadMarketData(normalized, key, cached);
+  const request = loadMarketData(normalized, key, cached, options);
   if (!options.force) inFlight.set(key, request);
 
   try {
@@ -147,7 +271,15 @@ async function fetchMarketData(symbols = DEFAULT_MARKET_SYMBOLS, options = {}) {
   }
 }
 
-async function loadMarketData(normalized, key, cached) {
+async function loadMarketData(normalized, key, cached, options = {}) {
+  const distributedCached = options.force ? null : await getDistributedCache(key);
+  const fallbackCached = distributedCached || cached;
+
+  if (distributedCached && Date.now() - distributedCached.time < CACHE_TTL_MS) {
+    cache.set(key, distributedCached);
+    return withCacheMetadata(distributedCached, 'hit', { layer: 'redis' });
+  }
+
   try {
     const payload = await withTimeout(
       fetchProviderQuotes(normalized),
@@ -160,23 +292,58 @@ async function loadMarketData(normalized, key, cached) {
     }
 
     const data = { ...payload, cache: { status: 'miss', ageMs: 0, ttlMs: CACHE_TTL_MS } };
-    cache.set(key, { time: Date.now(), data: payload });
+    await setCacheEntry(key, { time: Date.now(), data: payload });
     return data;
   } catch (err) {
-    if (cached && Date.now() - cached.time < STALE_TTL_MS) {
+    if (fallbackCached && Date.now() - fallbackCached.time < STALE_TTL_MS) {
       return {
-        ...cached.data,
+        ...fallbackCached.data,
         cache: {
           status: 'stale',
-          ageMs: Date.now() - cached.time,
+          ageMs: Date.now() - fallbackCached.time,
           ttlMs: CACHE_TTL_MS,
           staleTtlMs: STALE_TTL_MS,
+          layer: distributedCached ? 'redis' : 'memory',
           reason: err.message,
         },
       };
     }
     throw err;
   }
+}
+
+async function getDistributedCache(key) {
+  if (!redisCache.isEnabled()) return null;
+  const cached = await redisCache.getJson(redisCache.buildCacheKey('market:quotes:v1', key));
+  if (!isValidCacheEntry(cached)) return null;
+  return cached;
+}
+
+async function setCacheEntry(key, entry) {
+  cache.set(key, entry);
+  if (!redisCache.isEnabled()) return;
+  await redisCache.setJson(redisCache.buildCacheKey('market:quotes:v1', key), entry, STALE_TTL_MS);
+}
+
+function withCacheMetadata(entry, status, extra = {}) {
+  return {
+    ...entry.data,
+    cache: {
+      status,
+      ageMs: Date.now() - entry.time,
+      ttlMs: CACHE_TTL_MS,
+      ...extra,
+    },
+  };
+}
+
+function isValidCacheEntry(entry) {
+  return Boolean(
+    entry
+    && Number.isFinite(Number(entry.time))
+    && entry.data
+    && Array.isArray(entry.data.quotes)
+  );
 }
 
 async function fetchProviderQuotes(symbols) {
@@ -228,18 +395,18 @@ async function fetchFinnhubQuotes(symbols) {
   const quotes = [];
   const errors = [];
 
-  for (const symbol of symbols) {
+  const results = await mapWithConcurrency(symbols, FINNHUB_QUOTE_CONCURRENCY, async (symbol) => {
     try {
-      const quote = await fetchFinnhubQuote(symbol);
-      if (quote) {
-        quotes.push(quote);
-      } else {
-        errors.push({ symbol, error: 'No Finnhub quote returned' });
-      }
+      return { symbol, quote: await fetchFinnhubQuote(symbol) };
     } catch (error) {
-      errors.push({ symbol, error: error.message || 'Finnhub quote failed' });
+      return { symbol, error: error.message || 'Finnhub quote failed' };
     }
-  }
+  });
+
+  results.forEach((result) => {
+    if (result.quote) quotes.push(result.quote);
+    else errors.push({ symbol: result.symbol, error: result.error || 'No Finnhub quote returned' });
+  });
 
   if (!quotes.length && errors.length) {
     throw new Error(errors.map((entry) => `${entry.symbol}: ${entry.error}`).join('; '));
@@ -257,7 +424,7 @@ async function fetchFinnhubQuote(symbol) {
   const finnhubSymbol = toFinnhubSymbol(symbol);
   const response = await runFinnhubRequest(() => axios.get(`${FINNHUB_BASE_URL}/quote`, {
     params: { symbol: finnhubSymbol },
-    timeout: MARKET_DATA_TIMEOUT_MS,
+    timeout: FINNHUB_QUOTE_TIMEOUT_MS,
     httpsAgent,
     headers: {
       Accept: 'application/json',
@@ -477,6 +644,20 @@ function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+async function mapWithConcurrency(items, concurrency, worker) {
+  const results = new Array(items.length);
+  let nextIndex = 0;
+  const workers = Array.from({ length: Math.min(Math.max(1, concurrency), items.length) }, async () => {
+    while (nextIndex < items.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      results[index] = await worker(items[index]);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
 function withTimeout(promise, ms, message) {
   let timeout;
   const timer = new Promise((_, reject) => {
@@ -547,6 +728,17 @@ function normalizeFinnhubQuote(quote, requestedSymbol, providerSymbol) {
   };
 }
 
+function normalizeFinnhubSearchResult(result) {
+  const symbol = String(result?.symbol || result?.displaySymbol || '').trim().toUpperCase();
+  if (!symbol) return null;
+  return {
+    symbol,
+    displaySymbol: String(result.displaySymbol || symbol).trim(),
+    name: String(result.description || result.displaySymbol || symbol).trim(),
+    type: String(result.type || 'security').trim(),
+  };
+}
+
 function normalizeFinnhubTrade(trade, symbolByProvider = new Map()) {
   const providerSymbol = String(trade?.s || '').toUpperCase();
   const symbol = symbolByProvider.get(providerSymbol) || fromFinnhubSymbol(providerSymbol);
@@ -614,4 +806,5 @@ module.exports = {
   getFinnhubWebSocketConfig,
   normalizeFinnhubTrade,
   normalizeSymbols,
+  searchMarketSymbols,
 };

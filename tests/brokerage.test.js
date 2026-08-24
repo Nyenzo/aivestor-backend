@@ -1,8 +1,27 @@
 
 const request = require('supertest');
-const { app } = require('../app');
 const jwt = require('jsonwebtoken');
 const admin = require('firebase-admin');
+
+jest.mock('../services/marketData', () => {
+    const actual = jest.requireActual('../services/marketData');
+    return {
+        ...actual,
+        fetchMarketData: jest.fn(async (symbols) => ({
+            quotes: (symbols || []).map((symbol) => ({
+                symbol: String(symbol).toUpperCase(),
+                price: 200,
+                currency: 'USD',
+                source: 'finnhub',
+                timestamp: '2026-07-14T12:00:00.000Z',
+            })),
+            source: 'finnhub',
+            asOf: '2026-07-14T12:00:00.000Z',
+        })),
+    };
+});
+
+const { app } = require('../app');
 
 jest.mock('firebase-admin', () => {
     const mockFirestore = {
@@ -13,6 +32,7 @@ jest.mock('firebase-admin', () => {
         limit: jest.fn().mockReturnThis(),
         get: jest.fn(() => ({ empty: true, docs: [] })),
         add: jest.fn(() => ({ id: 'mock-id' })),
+        set: jest.fn(),
         update: jest.fn()
     };
     const mockFirestoreFn = jest.fn(() => mockFirestore);
@@ -156,12 +176,12 @@ describe('Brokerage Endpoints', () => {
             expect(res.status).toBe(401);
         });
 
-        it('should return error if no brokerage connected or succeed if one exists', async () => {
+        it('should return an empty successful sync when there are no simulated positions', async () => {
             const res = await request(app)
                 .post('/api/brokerage/sync')
                 .set('Authorization', `Bearer ${makeToken()}`);
-            // 400 if no connection, 200 if prior connect test left one, or 500 if Firestore unavailable
-            expect([200, 400, 500]).toContain(res.status);
+            expect(res.status).toBe(200);
+            expect(res.body.positions).toEqual([]);
         });
     });
 
@@ -196,12 +216,9 @@ describe('Brokerage Endpoints', () => {
                 .post('/api/brokerage/trade')
                 .set('Authorization', `Bearer ${makeToken()}`)
                 .send({ symbol: 'AAPL', type: 'buy', quantity: 10, price: 185.50 });
-            // 201 if Firestore is available, 500 otherwise
-            expect([201, 500]).toContain(res.status);
-            if (res.status === 201) {
-                expect(res.body.transaction).toBeTruthy();
-                expect(res.body.positions).toBeTruthy();
-            }
+            expect(res.status).toBe(201);
+            expect(res.body.transaction).toEqual(expect.objectContaining({ price: 200, priceSource: 'finnhub' }));
+            expect(res.body.positions).toBeTruthy();
         });
 
         it('should trade sell with no position', async () => {
@@ -221,7 +238,8 @@ describe('Brokerage Endpoints', () => {
                 .post('/api/brokerage/trade')
                 .set('Authorization', `Bearer ${makeToken()}`)
                 .send({ symbol: 'AAPL', type: 'buy', quantity: 10, price: 185.50 });
-            expect([201, 500]).toContain(res.status);
+            expect(res.status).toBe(201);
+            expect(res.body.positions[0]).toEqual(expect.objectContaining({ quantity: 15, averagePrice: 183.333333 }));
         });
     });
 });
